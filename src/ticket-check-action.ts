@@ -1,9 +1,17 @@
 import { debug as log, getInput, setFailed } from '@actions/core';
 import { context, getOctokit } from '@actions/github';
 
-// Helper function to retrieve ticket number from a string (either a shorthand reference or a full URL)
-const extractId = (value: string): string | null => {
-  const result = value.match(/\d+/);
+// Helper function to retrieve ticket number from a regex match.
+// Prefers the named capture group `ticketNumber` from the regex match,
+// then falls back to extracting the first digit sequence from the matched substring.
+const extractIdFromMatch = (match: RegExpExecArray): string | null => {
+  const fromGroup = match.groups?.ticketNumber;
+
+  if (fromGroup) {
+    return fromGroup;
+  }
+
+  const result = match[0].match(/\d+/);
 
   if (result !== null) {
     return result[0];
@@ -115,7 +123,7 @@ export async function run(): Promise<void> {
     if (branchCheck !== null) {
       debug('success', 'Branch name contains a reference to a ticket, updating title');
 
-      const id = extractId(branch);
+      const id = extractIdFromMatch(branchCheck);
 
       if (id === null) {
         setFailed('Could not extract a ticket ID reference from the branch');
@@ -198,7 +206,7 @@ export async function run(): Promise<void> {
     if (bodyCheck !== null) {
       debug('success', 'Body contains a reference to a ticket, updating title');
 
-      const id = extractId(bodyCheck[0]);
+      const id = extractIdFromMatch(bodyCheck);
 
       if (id === null) {
         setFailed('Could not extract a ticket shorthand reference from the body');
@@ -276,7 +284,7 @@ export async function run(): Promise<void> {
     if (bodyURLCheck !== null) {
       debug('success', 'Body contains a ticket URL, updating title');
 
-      const id = extractId(bodyURLCheck[0]);
+      const id = extractIdFromMatch(bodyURLCheck);
 
       if (id === null) {
         setFailed('Could not extract a ticket URL from the body');

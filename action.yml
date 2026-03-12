@@ -11,7 +11,7 @@ inputs:
   titleFormat:
     description: "The intended format the title should be set to if it doesn't match the regular expression. Available variables are `%prefix%`, `%id%`, and `%title%`"
     default: '%prefix%%id%: %title%'
-    required: true
+    required: false
 
   titleRegex:
     description: 'The regular expression used to search the title for the intended format'
@@ -71,7 +71,7 @@ inputs:
     required: false
 
 runs:
-  using: 'node16'
+  using: 'node20'
   main: 'build/index.js'
 
 branding:
