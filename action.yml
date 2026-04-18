@@ -52,11 +52,6 @@ inputs:
     default: 'gim'
     required: true
 
-  exemptUsers:
-    description: 'User(s) who will be exempt from the ticket check rules. Particularly useful for automated/bot PRs'
-    default: ''
-    required: false
-
   quiet:
     description: 'Suppress comment on successful PR title update'
     default: 'true'

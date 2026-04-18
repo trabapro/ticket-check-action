@@ -1,6 +1,16 @@
 import { debug as log, getInput, setFailed } from '@actions/core';
 import { context, getOctokit } from '@actions/github';
 
+// Central list of GitHub usernames exempt from automatic PR title rewrites.
+// Kept in source (not a per-repo input) so configuration lives in one place
+// instead of every consuming repo implementing and maintaining its own
+// exemption list. Validation still applies — exempt users must put a ticket
+// reference in the PR title or CI fails.
+// NOTE: This differs from upstream neofinancial behavior (which exempts users
+// from validation entirely and is configured per-repo via an `exemptUsers`
+// input). The `exemptUsers` input has been removed in this fork.
+const EXEMPT_USERS = ['sumeet-bansal'];
+
 // Helper function to retrieve ticket number from a regex match.
 // Prefers the named capture group `ticketNumber` from the regex match,
 // then falls back to extracting the first digit sequence from the matched substring.
@@ -27,35 +37,58 @@ const debug = (label: string, message: string): void => {
   log('');
 };
 
+const buildNewTitle = (titleFormat: string, id: string, title: string, ticketPrefix: string): string => {
+  let newTitle =
+    titleFormat.includes('%id%') && id && !title.includes(id)
+      ? titleFormat.replace('%id%', id)
+      : titleFormat.replace('%id%', '');
+
+  newTitle =
+    titleFormat.includes('%prefix%') && ticketPrefix && !title.includes(ticketPrefix)
+      ? newTitle.replace('%prefix%', ticketPrefix)
+      : newTitle.replace('%prefix%', '');
+
+  // If both prefix and id are already present in the title, leave it alone.
+  if (title.includes(ticketPrefix) && title.includes(id)) {
+    return title;
+  }
+
+  return newTitle.replace('%title%', title);
+};
+
 export async function run(): Promise<void> {
   try {
-    // Provide complete context object right away if debugging
     debug('context', JSON.stringify(context));
 
-    // Check for a ticket reference in the title
     const title: string = context?.payload?.pull_request?.title;
-    const titleRegexBase = getInput('titleRegex', { required: true });
-    const titleRegexFlags = getInput('titleRegexFlags', {
-      required: true,
-    });
-    const ticketLink = getInput('ticketLink', { required: false });
-    const titleRegex = new RegExp(titleRegexBase, titleRegexFlags);
-    const titleCheck = titleRegex.exec(title);
-
-    // Instantiate a GitHub Client instance
-    const token = getInput('token', { required: true });
-    const client = getOctokit(token);
-    const { owner, repo, number } = context.issue;
+    const body: string | undefined = context?.payload?.pull_request?.body;
+    const branch: string = context.payload.pull_request?.head.ref;
     const login = context.payload.pull_request?.user.login as string;
     const senderType = context.payload.pull_request?.user.type as string;
     const sender: string = senderType === 'Bot' ? login.replace('[bot]', '') : login;
 
-    const quiet = getInput('quiet', { required: false }) === 'true';
+    const token = getInput('token', { required: true });
+    const client = getOctokit(token);
+    const { owner, repo, number } = context.issue;
 
-    // Exempt Users
-    const exemptUsers = getInput('exemptUsers', { required: false })
-      .split(',')
-      .map((user) => user.trim());
+    const quiet = getInput('quiet', { required: false }) === 'true';
+    const ticketLink = getInput('ticketLink', { required: false });
+    const ticketPrefix = getInput('ticketPrefix');
+    const titleFormat = getInput('titleFormat', { required: true });
+
+    const isExemptFromRewrite = Boolean(sender) && EXEMPT_USERS.includes(sender);
+
+    debug('sender', sender);
+    debug('sender type', senderType);
+    debug('quiet mode', quiet.toString());
+    debug('exempt from rewrite', isExemptFromRewrite.toString());
+    debug('ticket link', ticketLink);
+
+    const titleRegex = new RegExp(
+      getInput('titleRegex', { required: true }),
+      getInput('titleRegexFlags', { required: true }),
+    );
+    const titleCheck = titleRegex.exec(title);
 
     const linkTicket = async (matchArray: RegExpMatchArray): Promise<void> => {
       debug('match array for linkTicket', JSON.stringify(matchArray));
@@ -107,157 +140,8 @@ export async function run(): Promise<void> {
       });
     };
 
-    // get the title format and ticket prefix
-    const ticketPrefix = getInput('ticketPrefix');
-    const titleFormat = getInput('titleFormat', { required: true });
-
-    // Check for a ticket reference in the branch
-    const branch: string = context.payload.pull_request?.head.ref;
-    const branchRegexBase = getInput('branchRegex', { required: true });
-    const branchRegexFlags = getInput('branchRegexFlags', {
-      required: true,
-    });
-    const branchRegex = new RegExp(branchRegexBase, branchRegexFlags);
-    const branchCheck = branchRegex.exec(branch);
-
-    if (branchCheck !== null) {
-      debug('success', 'Branch name contains a reference to a ticket, updating title');
-
-      const id = extractIdFromMatch(branchCheck);
-
-      if (id === null) {
-        setFailed('Could not extract a ticket ID reference from the branch');
-
-        return;
-      }
-
-      let newTitle = '';
-
-      if (titleFormat.includes('%id%') && id && !title.includes(id)) {
-        newTitle = titleFormat.replace('%id%', id);
-      } else {
-        newTitle = titleFormat.replace('%id%', '');
-      }
-
-      if (titleFormat.includes('%prefix%') && ticketPrefix && !title.includes(ticketPrefix)) {
-        newTitle = newTitle.replace('%prefix%', ticketPrefix);
-      } else {
-        newTitle = newTitle.replace('%prefix%', '');
-      }
-
-      if (title.includes(ticketPrefix) && title.includes(id)) {
-        // if both have already been updated just leave it alone
-        newTitle = title;
-      }
-
-      client.rest.pulls.update({
-        owner,
-        repo,
-        pull_number: number,
-        title: newTitle.replace('%title%', title),
-      });
-
-      if (!quiet) {
-        client.rest.pulls.createReview({
-          owner,
-          repo,
-          pull_number: number,
-          body: "Hey! I noticed that your PR contained a reference to the ticket in the branch name but not in the title. I went ahead and updated that for you. Hope you don't mind! ☺️",
-          event: 'COMMENT',
-        });
-      }
-
-      await linkTicket(branchCheck);
-
-      return;
-    }
-
-    // Debugging Entries
-    debug('sender', sender);
-    debug('sender type', senderType);
-    debug('quiet mode', quiet.toString());
-    debug('exempt users', exemptUsers.join(','));
-    debug('ticket link', ticketLink);
-
-    if (sender && exemptUsers.includes(sender)) {
-      debug('success', 'User is listed as exempt');
-
-      return;
-    }
-
-    // Retrieve the pull request body and verify it's not empty
-    const body = context?.payload?.pull_request?.body;
-
-    if (body === undefined) {
-      debug('failure', 'Body is undefined');
-      setFailed('Could not retrieve the Pull Request body');
-
-      return;
-    }
-
-    debug('body contents', body);
-
-    // Check for a ticket reference number in the body
-    const bodyRegexBase = getInput('bodyRegex', { required: true });
-    const bodyRegexFlags = getInput('bodyRegexFlags', { required: true });
-    const bodyRegex = new RegExp(bodyRegexBase, bodyRegexFlags);
-    const bodyCheck = bodyRegex.exec(body);
-
-    if (bodyCheck !== null) {
-      debug('success', 'Body contains a reference to a ticket, updating title');
-
-      const id = extractIdFromMatch(bodyCheck);
-
-      if (id === null) {
-        setFailed('Could not extract a ticket shorthand reference from the body');
-
-        return;
-      }
-
-      let newTitle = '';
-
-      if (titleFormat.includes('%id%') && id && !title.includes(id)) {
-        newTitle = titleFormat.replace('%id%', id);
-      } else {
-        newTitle = titleFormat.replace('%id%', '');
-      }
-
-      if (titleFormat.includes('%prefix%') && ticketPrefix && !title.includes(ticketPrefix)) {
-        newTitle = newTitle.replace('%prefix%', ticketPrefix);
-      } else {
-        newTitle = newTitle.replace('%prefix%', '');
-      }
-
-      if (title.includes(ticketPrefix) && title.includes(id)) {
-        // if both have already been updated just leave it alone
-        newTitle = title;
-      }
-
-      client.rest.pulls.update({
-        owner,
-        repo,
-        pull_number: number,
-        title: newTitle.replace('%title%', title),
-      });
-
-      if (!quiet) {
-        client.rest.pulls.createReview({
-          owner,
-          repo,
-          pull_number: number,
-          body: "Hey! I noticed that your PR contained a reference to the ticket in the body but not in the title. I went ahead and updated that for you. Hope you don't mind! ☺️",
-          event: 'COMMENT',
-        });
-      }
-
-      await linkTicket(bodyCheck);
-
-      return;
-    }
-
-    debug('title', title);
-
-    // Return and approve if the title includes a Ticket ID
+    // Validation is strictly title-based: the PR title must reference a ticket.
+    // If it does, we pass.
     if (titleCheck !== null) {
       debug('success', 'Title includes a ticket ID');
       await linkTicket(titleCheck);
@@ -265,76 +149,78 @@ export async function run(): Promise<void> {
       return;
     }
 
-    // Last ditch effort, check for a ticket reference URL in the body
-    const bodyURLRegexBase = getInput('bodyURLRegex', { required: false });
+    debug('title', title);
 
-    if (!bodyURLRegexBase) {
-      debug('failure', 'Title, branch, and body do not contain a reference to a ticket, and no body URL regex was set');
-      setFailed('No ticket was referenced in this pull request');
+    // Title does not reference a ticket — this run will fail. For non-exempt
+    // users, attempt to rewrite the title using branch name, body, or body URL
+    // as a source (in that order). The rewrite triggers a PR `edited` event
+    // which re-runs this workflow; the next run then passes on the new title.
+    if (!isExemptFromRewrite) {
+      const branchRegex = new RegExp(
+        getInput('branchRegex', { required: true }),
+        getInput('branchRegexFlags', { required: true }),
+      );
+      const branchCheck = branchRegex.exec(branch);
 
-      return;
+      const bodyRegex = new RegExp(
+        getInput('bodyRegex', { required: true }),
+        getInput('bodyRegexFlags', { required: true }),
+      );
+      const bodyCheck = body === undefined ? null : bodyRegex.exec(body);
+
+      const bodyURLRegexBase = getInput('bodyURLRegex', { required: false });
+      const bodyURLCheck =
+        bodyURLRegexBase && body !== undefined
+          ? new RegExp(bodyURLRegexBase, getInput('bodyURLRegexFlags', { required: true })).exec(body)
+          : null;
+
+      let rewriteMatch: RegExpExecArray | null = null;
+      let rewriteSource = '';
+
+      if (branchCheck !== null) {
+        rewriteMatch = branchCheck;
+        rewriteSource = 'branch name';
+      } else if (bodyCheck !== null) {
+        rewriteMatch = bodyCheck;
+        rewriteSource = 'body';
+      } else if (bodyURLCheck !== null) {
+        rewriteMatch = bodyURLCheck;
+        rewriteSource = 'body URL';
+      }
+
+      if (rewriteMatch !== null) {
+        debug('rewrite', `Rewriting title from ${rewriteSource} reference`);
+
+        const id = extractIdFromMatch(rewriteMatch);
+
+        if (id === null) {
+          debug('failure', `Could not extract ticket ID from ${rewriteSource} match`);
+        } else {
+          const newTitle = buildNewTitle(titleFormat, id, title, ticketPrefix);
+
+          client.rest.pulls.update({
+            owner,
+            repo,
+            pull_number: number,
+            title: newTitle,
+          });
+
+          if (!quiet) {
+            client.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number: number,
+              body: `Hey! I noticed that your PR contained a reference to the ticket in the ${rewriteSource} but not in the title. I went ahead and updated that for you. Hope you don't mind! ☺️`,
+              event: 'COMMENT',
+            });
+          }
+
+          await linkTicket(rewriteMatch);
+        }
+      }
     }
 
-    const bodyURLRegexFlags = getInput('bodyURLRegexFlags', {
-      required: true,
-    });
-    const bodyURLRegex = new RegExp(bodyURLRegexBase, bodyURLRegexFlags);
-    const bodyURLCheck = bodyURLRegex.exec(body);
-
-    if (bodyURLCheck !== null) {
-      debug('success', 'Body contains a ticket URL, updating title');
-
-      const id = extractIdFromMatch(bodyURLCheck);
-
-      if (id === null) {
-        setFailed('Could not extract a ticket URL from the body');
-
-        return;
-      }
-
-      let newTitle = '';
-
-      if (titleFormat.includes('%id%') && id && !title.includes(id)) {
-        newTitle = titleFormat.replace('%id%', id);
-      } else {
-        newTitle = titleFormat.replace('%id%', '');
-      }
-
-      if (titleFormat.includes('%prefix%') && ticketPrefix && !title.includes(ticketPrefix)) {
-        newTitle = newTitle.replace('%prefix%', ticketPrefix);
-      } else {
-        newTitle = newTitle.replace('%prefix%', '');
-      }
-
-      if (title.includes(ticketPrefix) && title.includes(id)) {
-        // if both have already been updated just leave it alone
-        newTitle = title;
-      }
-
-      client.rest.pulls.update({
-        owner,
-        repo,
-        pull_number: number,
-        title: newTitle.replace('%title%', title),
-      });
-
-      if (!quiet) {
-        client.rest.pulls.createReview({
-          owner,
-          repo,
-          pull_number: number,
-          body: "Hey! I noticed that your PR contained a reference to the ticket URL in the body but not in the title. I went ahead and updated that for you. Hope you don't mind! ☺️",
-          event: 'COMMENT',
-        });
-      }
-    }
-
-    if (titleCheck === null && branchCheck === null && bodyCheck === null && bodyURLCheck === null) {
-      debug('failure', 'Title, branch, and body do not contain a reference to a ticket');
-      setFailed('No ticket was referenced in this pull request');
-
-      return;
-    }
+    setFailed('PR title does not reference a ticket');
   } catch (error) {
     setFailed(error.message);
   }
